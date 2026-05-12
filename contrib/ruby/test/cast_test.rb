@@ -698,7 +698,7 @@ class CastTest < TrilogyTest
     time = @client.query("SELECT date_time_test FROM trilogy_test").to_a[0][0]
 
     assert_kind_of Time, time
-    assert_equal -1, time.to_i
+    assert_equal(-1, time.to_i)
     assert_equal 1969, time.year
     assert_equal 12, time.month
     assert_equal 31, time.day
