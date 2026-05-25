@@ -42,15 +42,14 @@ class AuthTest < TrilogyTest
   end
 
   def test_connect_native_with_password
-    return skip unless has_native_password_plugin?
-    # mysql_native_password user creation has issues on MariaDB (connection reset during ALTER USER)
-    return skip("mysql_native_password test not supported on MariaDB") if is_mariadb?
-    create_and_delete_test_user(username: "native", auth_plugin: "mysql_native_password") do
-      client = new_tcp_client username: "native", password: "password"
+    with_native_password_plugin do
+      create_and_delete_test_user(username: "native", auth_plugin: "mysql_native_password") do
+        client = new_tcp_client username: "native", password: "password"
 
-      refute_nil client
-    ensure
-      ensure_closed client
+        refute_nil client
+      ensure
+        ensure_closed client
+      end
     end
   end
 
@@ -128,16 +127,15 @@ class AuthTest < TrilogyTest
   end
 
   def test_connection_error_native
-    return skip unless has_native_password_plugin?
-    # mysql_native_password user creation has issues on MariaDB (connection reset during ALTER USER)
-    return skip("mysql_native_password test not supported on MariaDB") if is_mariadb?
-    create_and_delete_test_user(username: "native", auth_plugin: "mysql_native_password") do
+    with_native_password_plugin do
+      create_and_delete_test_user(username: "native", auth_plugin: "mysql_native_password") do
 
-      err = assert_raises Trilogy::ConnectionError do
-        new_tcp_client(username: "native", password: "incorrect")
+        err = assert_raises Trilogy::ConnectionError do
+          new_tcp_client(username: "native", password: "incorrect")
+        end
+
+        assert_includes err.message, "Access denied for user 'native"
       end
-
-      assert_includes err.message, "Access denied for user 'native"
     end
   end
 
@@ -170,6 +168,21 @@ class AuthTest < TrilogyTest
       assert_raises Trilogy::AuthPluginError do
         new_tcp_client username: "cleartext_user", password: "password"
       end
+    end
+  end
+
+  private
+
+  def with_native_password_plugin
+    return skip unless has_native_password_plugin?
+    # mysql_native_password user creation has issues on MariaDB (connection reset during ALTER USER)
+    return skip("mysql_native_password test not supported on MariaDB") if is_mariadb?
+    yield
+  rescue Trilogy::ProtocolError => error
+    if error.message.include?("Plugin 'mysql_native_password' is not loaded")
+      skip(error.message)
+    else
+      raise
     end
   end
 end

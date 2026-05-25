@@ -11,8 +11,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#include <trilogy.h>
-
 #include "trilogy-ruby.h"
 
 typedef struct _buffer_pool_entry_struct {
@@ -41,9 +39,7 @@ static void buffer_pool_free(void *data)
     buffer_pool *pool = (buffer_pool *)data;
     if (pool->capa) {
         for (size_t index = 0; index < pool->len; index++) {
-            // NB: buff was allocated by trilogy/buffer.h using raw `malloc`
-            // hence we must use raw `free`.
-            free(pool->entries[index].buff);
+            xfree(pool->entries[index].buff);
         }
         xfree(pool->entries);
     }
@@ -124,7 +120,7 @@ static void buffer_checkout(trilogy_buffer_t *buffer, size_t initial_capacity)
         buffer->buff = pool->entries[pool->len].buff;
         buffer->cap = pool->entries[pool->len].cap;
     } else {
-        buffer->buff = malloc(initial_capacity);
+        buffer->buff = xmalloc(initial_capacity);
         buffer->cap = initial_capacity;
     }
 }
@@ -165,10 +161,10 @@ static VALUE Trilogy_BaseConnectionError, Trilogy_ProtocolError, Trilogy_SSLErro
 
 static ID id_socket, id_host, id_port, id_username, id_password, id_found_rows, id_connect_timeout, id_read_timeout,
     id_write_timeout, id_keepalive_enabled, id_keepalive_idle, id_keepalive_interval, id_keepalive_count,
-    id_ivar_affected_rows, id_ivar_fields, id_ivar_last_insert_id, id_ivar_rows, id_ivar_query_time, id_password,
-    id_database, id_enable_cleartext_plugin, id_ssl_ca, id_ssl_capath, id_ssl_cert, id_ssl_cipher, id_ssl_crl, id_ssl_crlpath, id_ssl_key,
+    id_password, id_database, id_enable_cleartext_plugin,
+    id_ssl_ca, id_ssl_capath, id_ssl_cert, id_ssl_cipher, id_ssl_crl, id_ssl_crlpath, id_ssl_key,
     id_ssl_mode, id_tls_ciphersuites, id_tls_min_version, id_tls_max_version, id_multi_statement, id_multi_result,
-    id_from_code, id_from_errno, id_connection_options, id_max_allowed_packet;
+    id_from_code, id_from_errno, id_max_allowed_packet;
 
 struct trilogy_ctx {
     trilogy_conn_t conn;
@@ -468,6 +464,17 @@ escape the GVL on each wait operation without going through call_without_gvl */
 
     int newfd = dup(fd);
     if (newfd < 0) {
+        return TRILOGY_ERR;
+    }
+
+    int flags = fcntl(fd, F_GETFD); /* should not fail except EBADF. */
+    if (flags == -1) {
+        close(newfd);
+        return TRILOGY_ERR;
+    }
+
+    if (fcntl(newfd, F_SETFD, flags) != 0){
+        close(newfd);
         return TRILOGY_ERR;
     }
 
@@ -938,102 +945,107 @@ static VALUE read_query_response(VALUE vargs)
     double query_time = finish.tv_sec - start.tv_sec;
     query_time += (double)(finish.tv_nsec - start.tv_nsec) / 1000000000.0;
 
-    VALUE result = rb_obj_alloc(Trilogy_Result);
-
-    VALUE column_names = rb_ary_new2(column_count);
-    rb_ivar_set(result, id_ivar_fields, column_names);
+    VALUE column_names = 0;
 
     VALUE rows = rb_ary_new();
-    rb_ivar_set(result, id_ivar_rows, rows);
 
-    rb_ivar_set(result, id_ivar_query_time, DBL2NUM(query_time));
-
+    VALUE last_insert_id = Qnil, affected_rows = Qnil;
     if (rc == TRILOGY_OK) {
-        rb_ivar_set(result, id_ivar_last_insert_id, ULL2NUM(ctx->conn.last_insert_id));
-
-        rb_ivar_set(result, id_ivar_affected_rows, ULL2NUM(ctx->conn.affected_rows));
-
-        return result;
-    } else {
-        rb_ivar_set(result, id_ivar_last_insert_id, Qnil);
-        rb_ivar_set(result, id_ivar_affected_rows, Qnil);
+        last_insert_id = ULL2NUM(ctx->conn.last_insert_id);
+        affected_rows = ULL2NUM(ctx->conn.affected_rows);
     }
+    else {
+        VALUE rb_column_info;
+        struct column_info *column_info = ALLOCV_N(struct column_info, rb_column_info, column_count);
+        VALUE rb_ruby_values;
+        VALUE *row_ruby_values = ALLOCV_N(VALUE, rb_ruby_values, column_count);
 
-    VALUE rb_column_info;
-    struct column_info *column_info = ALLOCV_N(struct column_info, rb_column_info, column_count);
+        for (uint64_t i = 0; i < column_count; i++) {
+            trilogy_column_t column;
 
-    for (uint64_t i = 0; i < column_count; i++) {
-        trilogy_column_t column;
+            while (1) {
+                rc = trilogy_read_column(&ctx->conn, &column);
+
+                if (rc == TRILOGY_OK) {
+                    break;
+                }
+
+                if (rc != TRILOGY_AGAIN) {
+                    return read_query_error(args, rc, "trilogy_read_column");
+                }
+
+                rc = trilogy_sock_wait_read(ctx->conn.socket);
+                if (rc != TRILOGY_OK) {
+                    return read_query_error(args, rc, "trilogy_read_column");
+                }
+            }
+
+    #ifdef HAVE_RB_ENC_INTERNED_STR
+            row_ruby_values[i] = rb_enc_interned_str(column.name, column.name_len, ctx->encoding);
+    #else
+            row_ruby_values[i] = rb_enc_str_new(column.name, column.name_len, ctx->encoding);
+            OBJ_FREEZE(row_ruby_values[i]);
+    #endif
+
+            column_info[i].type = column.type;
+            column_info[i].flags = column.flags;
+            column_info[i].len = column.len;
+            column_info[i].charset = column.charset;
+            column_info[i].decimals = column.decimals;
+        }
+
+        column_names = rb_ary_new_from_values(column_count, row_ruby_values);
+
+        VALUE rb_trilogy_values;
+        trilogy_value_t *row_trilogy_values = ALLOCV_N(trilogy_value_t, rb_trilogy_values, column_count);
 
         while (1) {
-            rc = trilogy_read_column(&ctx->conn, &column);
+            int rc = trilogy_read_row(&ctx->conn, row_trilogy_values);
 
-            if (rc == TRILOGY_OK) {
+            if (rc == TRILOGY_AGAIN) {
+                rc = trilogy_sock_wait_read(ctx->conn.socket);
+                if (rc != TRILOGY_OK) {
+                    return read_query_error(args, rc, "trilogy_read_row");
+                }
+                continue;
+            }
+
+            if (rc == TRILOGY_EOF) {
                 break;
             }
 
-            if (rc != TRILOGY_AGAIN) {
-                return read_query_error(args, rc, "trilogy_read_column");
-            }
-
-            rc = trilogy_sock_wait_read(ctx->conn.socket);
-            if (rc != TRILOGY_OK) {
-                return read_query_error(args, rc, "trilogy_read_column");
-            }
-        }
-
-#ifdef HAVE_RB_ENC_INTERNED_STR
-        VALUE column_name = rb_enc_interned_str(column.name, column.name_len, ctx->encoding);
-#else
-        VALUE column_name = rb_enc_str_new(column.name, column.name_len, ctx->encoding);
-        OBJ_FREEZE(column_name);
-#endif
-
-        rb_ary_push(column_names, column_name);
-
-        column_info[i].type = column.type;
-        column_info[i].flags = column.flags;
-        column_info[i].len = column.len;
-        column_info[i].charset = column.charset;
-        column_info[i].decimals = column.decimals;
-    }
-
-    VALUE rb_row_values;
-    trilogy_value_t *row_values = ALLOCV_N(trilogy_value_t, rb_row_values, column_count);
-
-    while (1) {
-        int rc = trilogy_read_row(&ctx->conn, row_values);
-
-        if (rc == TRILOGY_AGAIN) {
-            rc = trilogy_sock_wait_read(ctx->conn.socket);
             if (rc != TRILOGY_OK) {
                 return read_query_error(args, rc, "trilogy_read_row");
             }
-            continue;
-        }
 
-        if (rc == TRILOGY_EOF) {
-            break;
-        }
-
-        if (rc != TRILOGY_OK) {
-            return read_query_error(args, rc, "trilogy_read_row");
-        }
-
-        if (args->cast_options->flatten_rows) {
             for (uint64_t i = 0; i < column_count; i++) {
-                rb_ary_push(rows, rb_trilogy_cast_value(row_values + i, column_info + i, args->cast_options));
+                row_ruby_values[i] = rb_trilogy_cast_value(row_trilogy_values + i, column_info + i, args->cast_options);
             }
-        } else {
-            VALUE row = rb_ary_new2(column_count);
-            for (uint64_t i = 0; i < column_count; i++) {
-                rb_ary_push(row, rb_trilogy_cast_value(row_values + i, column_info + i, args->cast_options));
+
+            if (args->cast_options->flatten_rows) {
+                rb_ary_cat(rows, row_ruby_values, column_count);
+            } else {
+                rb_ary_push(rows, rb_ary_new_from_values(column_count, row_ruby_values));
             }
-            rb_ary_push(rows, row);
         }
+
+        ALLOCV_END(rb_column_info);
+        ALLOCV_END(rb_trilogy_values);
+        ALLOCV_END(rb_ruby_values);
     }
 
-    return result;
+    return rb_class_new_instance(
+        6,
+        (VALUE []){
+            column_names,
+            rows,
+            DBL2NUM(query_time),
+            (ctx->conn.server_status & TRILOGY_SERVER_STATUS_IN_TRANS) ? Qtrue : Qfalse,
+            affected_rows,
+            last_insert_id,
+        },
+        Trilogy_Result
+    );
 }
 
 static VALUE execute_read_query_response(struct trilogy_ctx *ctx)
@@ -1466,12 +1478,6 @@ RUBY_FUNC_EXPORTED void Init_cext(void)
     id_multi_result = rb_intern("multi_result");
     id_from_code = rb_intern("from_code");
     id_from_errno = rb_intern("from_errno");
-    id_ivar_affected_rows = rb_intern("@affected_rows");
-    id_ivar_fields = rb_intern("@fields");
-    id_ivar_last_insert_id = rb_intern("@last_insert_id");
-    id_ivar_rows = rb_intern("@rows");
-    id_ivar_query_time = rb_intern("@query_time");
-    id_connection_options = rb_intern("@connection_options");
 
     rb_trilogy_cast_init();
 

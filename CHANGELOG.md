@@ -5,15 +5,61 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
-### Added
-
-- Support `caching_sha2_password` over TCP without TLS by requesting the server RSA public key when needed. #26
-- Now raise an explicit error when a single connection is being used concurrently by multiple threads or fibers. #226.
-- `Trilogy#abandon_results!` as an optimized alternative to `client.next_result while client.more_results_exist?`.
+## 2.12.5
 
 ### Fixed
 
+- Properly set `FD_CLOEXEC` on trilogy sockets created by Ruby to avoid leaking file descriptor on `exec`.
+
+## 2.12.4
+
+### Fixed
+
+- Add workaround to fix compilation on older rubies combined in Xcode 26.4+.
+
+## 2.12.3
+
+### Fixed
+
+- Exclude `Trilogy#server_version` from `Synchronization` mutex.
+
+## 2.12.2
+
+- Fixed incorrect usec for local time casting.
+
+## 2.12.1
+
+- Fixed local time casting sometimes using the wrong offset.
+
+## 2.12.0
+
+- Fixed compatibility with Manticore.
+- Improved performance of result parsing and type casting in the Ruby extension. Particularly for datetime fields.
+- Added `Trilogy::Result#in_transaction?`
+
+## 2.11.1
+
+### Fixed
+
+- Allow concurrent calls to `Trilogy#closed?`. #277.
+
+## 2.11.0
+
+### Changed
+
+- Establish socket connection in Ruby #218
+
+### Added
+
+- Support `caching_sha2_password` over TCP without TLS by requesting the server RSA public key when needed. #262
+- Now raise an explicit error when a single connection is being used concurrently by multiple threads or fibers. #226.
+- `Trilogy#abandon_results!` as an optimized alternative to `client.next_result while client.more_results_exist?`. #264
+
+### Fixed
+
+- Handle server disconnects (Error 4031) correctly by raising `Trilogy::BaseConnectionError` instead of raising a QueryError / TRILOGY_INVALID_SEQUENCE_ID. #257.
 - Column names in results are now encoded using the connection encoding. #210.
+- Use correct malloc and free to avoid invalid pointer crashes #266 and #269
 
 ## 2.10.0
 

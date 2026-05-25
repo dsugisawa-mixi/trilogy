@@ -2,6 +2,22 @@ class Trilogy
   class Result
     attr_reader :fields, :rows, :query_time, :affected_rows, :last_insert_id
 
+    EMPTY_ARRAY = [].freeze
+    private_constant :EMPTY_ARRAY
+
+    def initialize(fields, rows, query_time, in_transaction, affected_rows, last_insert_id)
+      @fields = fields || EMPTY_ARRAY
+      @rows = rows || EMPTY_ARRAY
+      @query_time = query_time
+      @in_transaction = in_transaction
+      @affected_rows = affected_rows
+      @last_insert_id = last_insert_id
+    end
+
+    def in_transaction?
+      @in_transaction
+    end
+
     def count
       rows.count
     end
