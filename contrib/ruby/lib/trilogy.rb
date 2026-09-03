@@ -16,26 +16,38 @@ class Trilogy
     end
   private_constant :IO_TIMEOUT_ERROR
 
-  Synchronization = Module.new
+  module Synchronization
+    def initialize(...)
+      @mutex = Mutex.new
+      super
+    end
 
-  source = public_instance_methods(false).flat_map do |method|
-    [
-      "def #{method}(...)",
-        "raise SynchronizationError unless @mutex.try_lock",
-        "begin",
-          "super",
-        "ensure",
-          "@mutex.unlock",
+    NEVER = { Object => :never }.freeze
+    IMMEDIATE = { Object => :immediate }.freeze
+
+    synchronized_methods = Trilogy.public_instance_methods(false) - %i(closed? server_version)
+    source = synchronized_methods.flat_map do |method|
+      [
+        "def #{method}(...)",
+          "Thread.handle_interrupt(NEVER) do",
+            "raise SynchronizationError unless @mutex.try_lock",
+            "begin",
+              "Thread.handle_interrupt(IMMEDIATE) do",
+                "super",
+              "end",
+            "ensure",
+              "@mutex.unlock",
+            "end",
+          "end",
         "end",
-      "end",
-    ]
+      ]
+    end
+    class_eval(source.join(";"), __FILE__, __LINE__)
   end
-  Synchronization.class_eval(source.join(";"), __FILE__, __LINE__)
 
   prepend(Synchronization)
 
   def initialize(options = {})
-    @mutex = Mutex.new
     options[:port] = options[:port].to_i if options[:port]
     mysql_encoding = options[:encoding] || "utf8mb4"
     encoding = Trilogy::Encoding.find(mysql_encoding)
@@ -47,7 +59,7 @@ class Trilogy
     begin
       if host = options[:host]
         port = options[:port] || 3306
-        connect_timeout = options[:connect_timeout] || options[:write_timeout]
+        connect_timeout = options.fetch(:connect_timeout, 5) || options[:write_timeout]
 
         socket = TCPSocket.new(host, port, connect_timeout: connect_timeout)
 

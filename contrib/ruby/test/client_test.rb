@@ -38,7 +38,7 @@ class ClientTest < TrilogyTest
     socket = new_tcp_client.query("SHOW VARIABLES LIKE 'socket'").to_a[0][1]
 
     if !File.exist?(socket)
-      skip "cound not find socket at #{socket}"
+      skip "could not find socket at #{socket}"
     end
 
     client = new_unix_client(socket)
@@ -218,8 +218,6 @@ class ClientTest < TrilogyTest
     client.query("INSERT INTO trilogy_test (int_test) VALUES ('3')")
     client.query("INSERT INTO trilogy_test (int_test) VALUES ('1')")
 
-    results = []
-
     assert_equal [[1, 4]], client.query("SELECT id, int_test FROM trilogy_test WHERE id = 1; SELECT id, int_test FROM trilogy_test WHERE id IN (2, 3); SELECT id, int_test FROM trilogy_test").to_a
     assert_equal 2, client.abandon_results!
     assert_equal [[2]], client.query("SELECT 2").to_a
@@ -266,7 +264,10 @@ class ClientTest < TrilogyTest
 
     client.query("INSERT INTO trilogy_test (int_test) VALUES ('4')")
     client.query("INSERT INTO trilogy_test (int_test) VALUES ('3')")
-    client.query("INSERT INTO trilogy_test (int_test) VALUES ('1')")
+    result = client.query("INSERT INTO trilogy_test (int_test) VALUES ('1')")
+
+    assert_equal [], result.fields
+    assert_equal [], result.rows
 
     result = client.query_with_flags("SELECT id, int_test FROM trilogy_test", client.query_flags | Trilogy::QUERY_FLAGS_FLATTEN_ROWS)
 
@@ -338,6 +339,7 @@ class ClientTest < TrilogyTest
     assert_equal [{ "a" => 1, "b" => 2 }], result.each_hash.to_a
     assert_equal [[1, 2]], result.to_a
     assert_kind_of Float, result.query_time
+    refute_predicate result, :in_transaction?
     assert_in_delta 0.1, result.query_time, 0.1
   ensure
     ensure_closed client
@@ -417,6 +419,24 @@ class ClientTest < TrilogyTest
     assert_equal 1, result_unchanged.affected_rows
     assert_equal 1, result_changed.affected_rows
     assert_nil result_select.affected_rows
+  ensure
+    ensure_closed client
+  end
+
+  def test_trilogy_in_transaction_flag_on_result
+    client = new_tcp_client
+    create_test_table(client)
+
+    refute_predicate client.query("SELECT 1"), :in_transaction?
+    refute_predicate client.query("INSERT INTO trilogy_test (varchar_test, int_test) VALUES ('a', 1)"), :in_transaction?
+
+    assert_predicate client.query("BEGIN"), :in_transaction?
+    assert_predicate client.query("INSERT INTO trilogy_test (varchar_test, int_test) VALUES ('b', 2)"), :in_transaction?
+
+    refute_predicate client.query("COMMIT"), :in_transaction?
+
+    assert_predicate client.query("BEGIN"), :in_transaction?
+    refute_predicate client.query("ROLLBACK"), :in_transaction?
   ensure
     ensure_closed client
   end
@@ -591,8 +611,21 @@ class ClientTest < TrilogyTest
   def test_connect_timeout_with_only_write_timeout
     assert_raises Trilogy::TimeoutError do
       # 192.0.2.0/24 is TEST-NET-1 which should only be for docs/examples
-      new_tcp_client(host: "192.0.2.1", write_timeout: 0.1)
+      new_tcp_client(host: "192.0.2.1", write_timeout: 0.1, connect_timeout: nil)
     end
+  end
+
+  def test_default_connect_timeout
+    start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    assert_raises Trilogy::TimeoutError do
+      # 192.0.2.0/24 is TEST-NET-1 which should only be for docs/examples
+      new_tcp_client(host: "192.0.2.1")
+    end
+
+    # The default is 5s; anything much longer means we hit the OS-level
+    # timeout instead of the default connect_timeout.
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - start, :<, 30
   end
 
   def test_large_query
@@ -775,6 +808,25 @@ class ClientTest < TrilogyTest
   def test_server_version
     client = new_tcp_client
     assert_match %r{\A\d+\.\d+\.\d+}, client.server_version
+  end
+
+  def test_server_version_is_not_synchronized
+    # server_version is a pure memory read from the handshake greeting packet
+    # (no socket I/O), so it should be safe to call while another method holds
+    # the synchronization mutex. This matters because instrumentation libraries
+    # (e.g. OpenTelemetry) may call server_version inside a query span to
+    # record span attributes. Since query is synchronized, calling
+    # server_version from within it would raise SynchronizationError if
+    # server_version were also synchronized.
+    client = new_tcp_client
+    thread = Thread.new { client.query("SELECT SLEEP(1)") }
+    thread.join(0.2) # wait for query to start and hold the mutex
+
+    # server_version must not raise SynchronizationError
+    assert_match %r{\A\d+\.\d+\.\d+}, client.server_version
+
+    thread.join
+    client.close
   end
 
   def test_server_info
@@ -1032,6 +1084,29 @@ class ClientTest < TrilogyTest
     assert_includes ex.message, "getaddrinfo"
   end
 
+  def test_session_wait_timeout
+    client = new_tcp_client
+    client.query("SET @@SESSION.WAIT_TIMEOUT=1;")
+    sleep(1.1)
+
+    if is_mariadb?
+      assert_raises Trilogy::SyscallError::ECONNRESET, Trilogy::EOFError do
+        client.query("SELECT 1")
+      end
+    else
+      ex = assert_raises Trilogy::BaseConnectionError do
+        client.query("SELECT 1")
+      end
+
+      assert_includes ex.message, "The client was disconnected by the server because of inactivity"
+      assert_equal 4031, ex.error_code
+    end
+
+    assert_raises Trilogy::EOFError do
+      client.query("SELECT 1")
+    end
+  end
+
   def test_memsize
     require 'objspace'
     client = new_tcp_client
@@ -1183,6 +1258,10 @@ class ClientTest < TrilogyTest
     assert_operator Errno::ECONNRESET, :===, klass.new
     assert_operator SystemCallError, :===, klass.new
     assert_operator Trilogy::ConnectionError, :===, klass.new
+  end
+
+  def test_fd_leak_on_exec
+    assert system(RbConfig.ruby, File.expand_path("../fixtures/self-exec.rb", __FILE__))
   end
 
   if defined?(::Ractor)
